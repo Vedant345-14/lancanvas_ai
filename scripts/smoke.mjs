@@ -1,0 +1,60 @@
+// End-to-end smoke test against a RUNNING server:  npm run smoke -- http://192.168.1.10:8000
+// Simulates a host and two clients (viewer + editor) using the real HTTP and Socket.IO endpoints.
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const { io } = require('socket.io-client');
+const base = (process.argv[2] || 'http://localhost:8000').replace(/\/$/, '');
+let failed = 0;
+const check = (name, ok, extra = '') => { console.log(`${ok ? '  PASS' : '  FAIL'}  ${name}${extra ? ' — ' + extra : ''}`); if (!ok) failed++; };
+const post = async (p, body, token) => { const r = await fetch(base + p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: JSON.stringify(body) }); return { status: r.status, json: await r.json() }; };
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const connect = (token) => new Promise((resolve, reject) => {
+  const s = io(base, { auth: { token }, reconnection: false, forceNew: true }); const ev = {};
+  s.onAny((e, d) => (ev[e] ??= []).push(d));
+  s.once('session:init', (init) => resolve({ s, init, ev })); s.once('connect_error', (e) => reject(e)); setTimeout(() => reject(new Error('timeout')), 5000);
+});
+const rpc = (c, ev, data) => new Promise((r) => c.s.emit(ev, data, r));
+const rid = () => 'o' + Math.random().toString(36).slice(2, 12);
+
+console.log(`Smoke test against ${base}`);
+const health = await (await fetch(base + '/api/health')).json();
+check('server reachable, /api/health ok', health.ok === true, `aiConfigured=${health.aiConfigured}`);
+const page = await (await fetch(base + '/')).text();
+check('landing page served', /<div id="root">/.test(page));
+
+const created = await post('/api/sessions', { name: 'Smoke Test', hostName: 'Host', requireApproval: true });
+check('FLOW 1: host creates classroom', created.status === 201 && /^[A-Z0-9]{6}$/.test(created.json.code), created.json.code);
+const code = created.json.code;
+const host = await connect(created.json.token);
+const a = await post(`/api/sessions/${code}/join`, { name: 'Asha' }); const b = await post(`/api/sessions/${code}/join`, { name: 'Ben' });
+check('FLOW 2: clients join as pending', a.json.status === 'pending' && b.json.status === 'pending');
+const ca = await connect(a.json.token), cb = await connect(b.json.token);
+check('pending client gets no board data', ca.init.pending === true && ca.init.objects === undefined);
+await wait(200);
+check('host receives join requests', (host.ev['join:request'] ?? []).length === 2);
+await rpc(host, 'host:decision', { participantId: a.json.participantId, action: 'approve' });
+await rpc(host, 'host:decision', { participantId: b.json.participantId, action: 'approve' });
+await wait(300);
+check('clients approved and receive board', ca.ev['session:init']?.some((i) => i.pending === false) && cb.ev['session:init']?.some((i) => i.pending === false));
+const bad = await rpc(ca, 'board:add', { object: { id: rid(), type: 'rect', x: 0, y: 0, w: 50, h: 50, color: '#4263EB', strokeWidth: 3 } });
+check('FLOW 4: viewer drawing rejected by server', bad.ok === false && /view-only/.test(bad.error), bad.error);
+await wait(200);
+check('rejected drawing never reached other clients', !host.ev['board:added'] && !cb.ev['board:added']);
+await rpc(host, 'host:setParticipant', { participantId: a.json.participantId, perms: { canDraw: true } });
+await wait(200);
+const oid = rid();
+const ok = await rpc(ca, 'board:add', { object: { id: oid, type: 'text', x: 10, y: 10, w: 120, h: 30, text: 'TCP vs UDP', fontSize: 22, color: '#17233C', strokeWidth: 1 } });
+await wait(300);
+check('FLOW 3: editor drawing accepted and broadcast live', ok.ok && cb.ev['board:added']?.[0]?.id === oid && host.ev['board:added']?.[0]?.id === oid);
+check('other viewer still blocked', (await rpc(cb, 'board:add', { object: { id: rid(), type: 'rect', x: 0, y: 0, w: 5, h: 5, color: '#000000', strokeWidth: 1 } })).ok === false);
+await rpc(ca, 'chat:send', { text: 'hello class' }); await wait(300);
+check('FLOW 5: chat delivered to all', [host, cb].every((c) => c.ev['chat:message']?.some((m) => m.text === 'hello class')));
+const ai = await post(`/api/sessions/${code}/ai/notes`, {}, created.json.token);
+check('FLOW 6: AI endpoint responds sensibly', ai.status === (health.aiConfigured ? 200 : 503), `${ai.status} ${ai.json.code ?? ''}`);
+const imp = await post(`/api/sessions/${code}/ai/notes`, {}, b.json.token);
+check('AI denied to participants until host allows it', imp.status === 403);
+ca.s.disconnect(); await wait(100);
+const re = await connect(a.json.token);
+check('FLOW 7: reconnect restores board, permission and chat (no duplicates)', re.init.objects.length === 1 && re.init.me.effective.draw === true && new Set(re.init.chat.map((m) => m.id)).size === re.init.chat.length);
+[host, cb, re].forEach((c) => c.s.disconnect());
+console.log(failed ? `\n${failed} check(s) FAILED` : '\nAll smoke checks passed'); process.exit(failed ? 1 : 0);

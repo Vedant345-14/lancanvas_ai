@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+data/*
+!data/.gitkeep
+uploads/*
+!uploads/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+.session_secret
+.vite/
+*.log
+coverage/
+.DS_Store
